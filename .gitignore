@@ -1,2 +1,5 @@
-LICENSE
-*.sh
+__pycache__/
+
+# weights
+llama-2-*
+tokenizer.model
