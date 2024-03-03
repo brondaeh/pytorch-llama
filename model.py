@@ -12,7 +12,7 @@ class ModelArgs:
     n_layers: int = 32
     n_heads: int = 32                   # number of heads for queries
     n_kv_heads: Optional[int] = None    # number of heads for keys and values
-    vocab_size: int = -1                # set when tokenizer is loaded
+    vocab_size: int = -1                # vocab_size is set when tokenizer is loaded
 
     # Feed forward network parameters
     multiple_of: int = 256
@@ -29,73 +29,108 @@ class ModelArgs:
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))     # gamma parameter
+        self.eps = eps                                  # epsilon parameter used to avoid division by 0
+        self.weight = nn.Parameter(torch.ones(dim))     # learnable gamma parameter used for scaling
     
     def _norm(self, x: torch.Tensor):
-        # (batch, seq_len, dim) * (batch, seq_len, 1) = (batch, seq_len, dim)
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)      # rsqrt = 1 / sqrt(x)
+        # x.pow(2) squares each element of the x tensor
+        # mean(-1, keepDim=True) computes the mean along the last dimension and does not alter the dimension
+        # self.eps is added to the denominator to prevent division by 0
+        # torch.rsqrt() computes the reciprocal of the square root element-wise
+        # multiply the result element-wise to the input tensor x
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)  # (batch, seq_len, dim) * (batch, seq_len, 1) = (batch, seq_len, dim)
 
     def forward(self, x: torch.Tensor):
-        # (dim) * (batch, seq_len, dim) = (batch, seq_len, dim)
-        return self.weight * self._norm(x.float()).type_as(x)
+        # input tensor x is cast to a float for numerical stability with x.float()
+        # normalized with self._norm, checked for equivalent data type with type_as(x) and scaled by self.weight (gamma)
+        return self.weight * self._norm(x.float()).type_as(x)       # (dim) * (batch, seq_len, dim) = (batch, seq_len, dim)
 
 
 def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, theta: float = 10000.0):
+    '''
+    Precomputes the positional frequencies used in rotary positional embeddings
+
+    Args:
+    - head_dim (int): number of dimensions for each head
+    - seq_len (int): sequence length
+    - device (str): device used for computation
+    - theta (float): theta magnitude is 10000.0 as described in the RoFormer paper
+
+    Return: 
+    - freqs_complex (torch.complex): a tensor of the calculated complex frequencies
+    '''
     # Check that the embedding dimension is even as specified in the RoFormer paper
     assert head_dim % 2 == 0, "Dimension must be even (divisible by 2)."
 
-    # Build theta parameters
-    # theta_i = 10000 ^ (-2(i-1)/dim) for i [1, 2, ..., dim / 2]
-    # Shape: (head_dim / 2)
-    theta_numerator = torch.arange(0, head_dim, 2).float()
+    # Build theta parameters: theta_i = 10000 ^ (-2(i-1)/dim) for i [1, 2, ..., dim / 2]
+    # theta_numerator is a tensor of values from 0 to head_dim - 1 with a step of 2
+    theta_numerator = torch.arange(0, head_dim, 2).float()              # (head_dim / 2)
 
-    # Shape: (head_dim / 2)
-    theta = 1.0 / (theta ** (theta_numerator / head_dim)).to(device)
+    # Calculates the theta parameters described by the previous equation (theta_i)
+    theta = 1.0 / (theta ** (theta_numerator / head_dim)).to(device)    # (head_dim / 2)
 
-    # Construct the positions (m parameter)
-    # Shape: (seq_len)
-    m = torch.arange(seq_len, device=device)
+    # Construct the positions: m is a tensor of values from 0 to seq_len - 1
+    m = torch.arange(seq_len, device=device)                            # (seq_len)
 
     # Multiply each theta by each position using outer product to get a matrix of all m_i * theta_i combinations
-    # Shape: (seq_len) outer_product (head_dim / 2) -> (seq_len, head_dim / 2)
-    freqs = torch.outer(m, theta).float()
+    freqs = torch.outer(m, theta).float()                               # (seq_len) outer_product (head_dim / 2) -> (seq_len, head_dim / 2)
 
-    # Compute complex polar form c = R * exp(i * m * theta), where R = 1
-    # Shape: (seq_len, head_dim / 2) -> (seq_len, head_dim / 2)
-    freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
+    # Compute complex polar form: c = R * exp(i * m * theta), where R = 1
+    freqs_complex = torch.polar(torch.ones_like(freqs), freqs)          # (seq_len, head_dim / 2) -> (seq_len, head_dim / 2)
 
     return freqs_complex
 
 def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device: str):
-    # (batch, seq_len, h, head_dim) -> (batch, seq_len, h, head_diim / 2)
-    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    '''
+    Applies the rotary positional embeddings (RoPE) to the input tensor x using freqs_complex
 
-    # (seq_len, head_dim / 2) -> (1, seq_len, 1, head_dim / 2)
-    freqs_complex = freqs_complex.unsqueeze(0).unsqueeze(2)
+    Args:
+    - x (torch.Tensor): the input tensor representing the input sequence
+    - freqs_complex (torch.complex): a tensor of the calculated complex frequencies from precompute_theta_pos_frequencies
+    - device (str): the device used for computation
 
-    # (batch, seq_len, h, head_dim / 2) * (1, seq_len, 1, head_dim / 2) -> (batch, seq_len, h, head_dim / 2)
-    x_rotated = x_complex * freqs_complex
+    Return:
+    - x_out (torch.Tensor): the input tensor x after RoPE is applied
+    '''
+    # Reshape x to have 2 dimensions for complex representation, the head_dim dimension is split: a + jb
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))  # (batch, seq_len, h, head_dim) -> (batch, seq_len, h, head_dim / 2)
 
-    # (batch, seq_len, h, head_dim / 2) -> (batch, seq_len, h, head_dim / 2, 2)
-    x_out = torch.view_as_real(x_rotated)
+    # Reshape freqs_complex to match x_complex
+    freqs_complex = freqs_complex.unsqueeze(0).unsqueeze(2)                     # (seq_len, head_dim / 2) -> (1, seq_len, 1, head_dim / 2)
 
-    # (batch, seq_len, h, head_dim / 2, 2) -> (batch, seq_len, h, head_dim)
-    x_out = x_out.reshape(*x.shape)
+    # Multiply each complex number in x_complex with the corresponding complex number in freqs_complex, this rotates the complex number
+    x_rotated = x_complex * freqs_complex                                       # (batch, seq_len, h, head_dim / 2) * (1, seq_len, 1, head_dim / 2) -> (batch, seq_len, h, head_dim / 2)
+
+    # Convert the complex number back to a real number
+    x_out = torch.view_as_real(x_rotated)                                       # (batch, seq_len, h, head_dim / 2) -> (batch, seq_len, h, head_dim / 2, 2)
+
+    # Reshape the tensor back to its original shape by removing the extra dimension
+    x_out = x_out.reshape(*x.shape)                                             # (batch, seq_len, h, head_dim / 2, 2) -> (batch, seq_len, h, head_dim)
 
     return x_out.type_as(x).to(device)
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    '''
+    Replicates key or value tensors to be used for Grouped Multi-Query Self-Attention
+
+    Args:
+    - x (torch.Tensor): the input key or value tensor
+    - n_rep (int): the number of repetitions to replicate the KV tensors
+
+    Return:
+    - x (torch.Tensor): the input tensor after replication
+    '''
+    # Unpack the dimensions of the input key/value tensor
     batch_size, seq_len, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
+    if n_rep == 1:  # Return the original tensor if n_rep is 1
         return x
     else:
         return(
-            # (batch, seq_len, n_kv_heads, 1, head_dim)
+            # Add an extra dimension along the fourth axis: (batch, seq_len, n_kv_heads, 1, head_dim)
             x[:, :, :, None, :]
-            # (batch, seq_len, n_kv_heads, n_rep, head_dim)
+            # Expand the tensor by replicating the dimension n_rep along the fourth axis: (batch, seq_len, n_kv_heads, n_rep, head_dim)
             .expand(batch_size, seq_len, n_kv_heads, n_rep, head_dim)
-            # (batch, seq_len, n_kv_heads * n_rep, head_dim)
+            # Reshape the tensor by combining the third and fourth dimensions together: (batch, seq_len, n_kv_heads * n_rep, head_dim)
             .reshape(batch_size, seq_len, n_kv_heads * n_rep, head_dim)
         )
 
@@ -190,14 +225,11 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(args.dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor):
-        # (batch, seq_len, dim) -> (batch, seq_len, hidden_dim)
-        swish = F.silu(self.w1(x))
-        # (batch, seq_len, dim) -> (batch, seq_len, hidden_dim)
-        x_V = self.w3(x)
-        # (batch, seq_len, hidden_dim) * (batch, seq_len, hidden_dim) -> (batch, seq_len, hidden_dim)
-        x = swish * x_V
-        # (batch, seq_len, hidden_dim) -> (batch, seq_len, dim)
-        x = self.w2(x)
+        # Apply Swish activation function (SiLU) to the input after transformation from w1
+        swish = F.silu(self.w1(x))  # (batch, seq_len, dim) -> (batch, seq_len, hidden_dim)
+        x_V = self.w3(x)            # (batch, seq_len, dim) -> (batch, seq_len, hidden_dim)
+        x = swish * x_V             # (batch, seq_len, hidden_dim) * (batch, seq_len, hidden_dim) -> (batch, seq_len, hidden_dim)
+        x = self.w2(x)              # (batch, seq_len, hidden_dim) -> (batch, seq_len, dim)
 
         return x
 
@@ -219,9 +251,11 @@ class EncoderBlock(nn.Module):
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
-        # (batch, seq_len, dim) + (batch, seq_len, dim) -> (batch, seq_len, dim)
-        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_complex)
-        out = h + self.feed_forward.forward(self.ffn_norm(h))
+        # Applies RMS norm to x then passes x through self-attention; adds the original input tensor x to the result as a residual connection
+        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_complex)    # (batch, seq_len, dim) + (batch, seq_len, dim) -> (batch, seq_len, dim)
+
+        # Applies RMS norm to h then passes h through the feed forward layer; adds the original tensor h to the result as a residual connection
+        out = h + self.feed_forward.forward(self.ffn_norm(h))   # (batch, seq_len, dim) + (batch, seq_len, dim) -> (batch, seq_len, dim)
 
         return out
 

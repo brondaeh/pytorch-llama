@@ -83,7 +83,7 @@ class LLaMA:
         tokens = torch.full((batch_size, total_len), pad_id, dtype=torch.long, device=device)
         for k, t in enumerate(prompt_tokens):
             # Populate the initial tokens with the prompt tokens
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)  # NOTE: torch.tensor is lowercase, torch.Tensor creates an error which is not resolved
         
         eos_reached = torch.tensor([False] * batch_size, device=device)
         prompt_tokens_mask = tokens != pad_id # True if the token is a prompt token, False otherwise
